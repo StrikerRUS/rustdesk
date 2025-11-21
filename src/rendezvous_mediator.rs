@@ -341,9 +341,18 @@ impl RendezvousMediator {
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
+        
+        log::info!("DEBUG_MEDIATOR: TCP/WS connecting to {}", host);
+
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
+        
+        log::info!("DEBUG_MEDIATOR: TCP/WS connected to {}", host);
+
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
+        
+        log::info!("DEBUG_MEDIATOR: Connection secured/ready");
+
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
             host: host.clone(),
@@ -353,9 +362,13 @@ impl RendezvousMediator {
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
-        // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
+        
         Config::set_host_key_confirmed(&rz.host_prefix, false);
+        
         loop {
+
+            log::info!("DEBUG_MEDIATOR: Loop tick"); 
+
             let mut update_latency = || {
                 let latency = last_register_sent
                     .map(|x| x.elapsed().as_micros() as i64)
@@ -366,10 +379,10 @@ impl RendezvousMediator {
             select! {
                 res = conn.next() => {
                     last_recv_msg = Instant::now();
+                    log::info!("DEBUG_MEDIATOR: Received data from server");
+
                     let bytes = res.ok_or_else(|| anyhow::anyhow!("Rendezvous connection is reset by the peer"))??;
                     if bytes.is_empty() {
-                        // After fixing frequent register_pk, for websocket, nginx need to set proxy_read_timeout to more than 60 seconds, eg: 120s
-                        // https://serverfault.com/questions/1060525/why-is-my-websocket-connection-gets-closed-in-60-seconds
                         conn.send_bytes(bytes::Bytes::new()).await?;
                         continue; // heartbeat
                     }
@@ -380,14 +393,23 @@ impl RendezvousMediator {
                     if SHOULD_EXIT.load(Ordering::SeqCst) {
                         break;
                     }
-                    // https://www.emqx.com/en/blog/mqtt-keep-alive
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
+                        log::error!("DEBUG_MEDIATOR: Timeout! KeepAlive expired.");
                         bail!("Rendezvous connection is timeout");
                     }
-                    if (!Config::get_key_confirmed() ||
-                        !Config::get_host_key_confirmed(&rz.host_prefix)) &&
-                        last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL) >= REG_INTERVAL {
-                        rz.register_pk(Sink::Stream(&mut conn)).await?;
+
+                    let key_confirmed = Config::get_key_confirmed();
+                    let host_confirmed = Config::get_host_key_confirmed(&rz.host_prefix);
+                    let time_passed = last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL);
+                    
+                    log::info!("DEBUG_MEDIATOR: Check send. KeyConf: {}, HostConf: {}, TimePassed: {}", key_confirmed, host_confirmed, time_passed);
+
+                    if (!key_confirmed || !host_confirmed) && time_passed >= REG_INTERVAL {
+                        log::info!("DEBUG_MEDIATOR: Sending RegisterPk...");
+                        match rz.register_pk(Sink::Stream(&mut conn)).await {
+                            Ok(_) => log::info!("DEBUG_MEDIATOR: RegisterPk sent successfully"),
+                            Err(e) => log::error!("DEBUG_MEDIATOR: Failed to send RegisterPk: {}", e),
+                        }
                         last_register_sent = Some(Instant::now());
                     }
                 }
