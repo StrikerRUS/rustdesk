@@ -57,6 +57,7 @@ impl RendezvousMediator {
     }
 
     pub async fn start_all() {
+        log::info!("DEBUG_TRACE: start_all() ENTERED");
         crate::test_nat_type();
         if config::is_outgoing_only() {
             loop {
@@ -96,18 +97,24 @@ impl RendezvousMediator {
             let timeout = Arc::new(RwLock::new(CONNECT_TIMEOUT));
             let conn_start_time = Instant::now();
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
-            if !config::option2bool("stop-service", &Config::get_option("stop-service"))
-                && !crate::platform::installing_service()
+            let stop_service = config::option2bool("stop-service", &Config::get_option("stop-service"));
+            let installing = crate::platform::installing_service();
+            log::info!("DEBUG_TRACE: start_all loop tick. StopService: {}, Installing: {}", stop_service, installing);
+
+            if !stop_service && !installing
             {
                 let mut futs = Vec::new();
                 let servers = Config::get_rendezvous_servers();
+                log::info!("DEBUG_TRACE: Servers list to connect: {:?}", servers);
                 SHOULD_EXIT.store(false, Ordering::SeqCst);
                 MANUAL_RESTARTED.store(false, Ordering::SeqCst);
                 for host in servers.clone() {
                     let server = server.clone();
                     let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
+                        log::info!("DEBUG_TRACE: Spawning connection task for host: {}", host);
                         if let Err(err) = Self::start(server, host).await {
+                            log::error!("DEBUG_TRACE: start() failed for {}: {}", host, err);
                             let err = format!("rendezvous mediator error: {err}");
                             // When user reboot, there might be below error, waiting too long
                             // (CONNECT_TIMEOUT 18s) will make user think there is bug
@@ -124,6 +131,7 @@ impl RendezvousMediator {
                 }
                 join_all(futs).await;
             } else {
+                log::info!("DEBUG_TRACE: Service stopped or installing, closing connections");
                 server.write().unwrap().close_connections();
             }
             Config::reset_online();
@@ -339,17 +347,31 @@ impl RendezvousMediator {
     }
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
+        log::info!("DEBUG_TRACE: start_tcp ENTERED for {}", host);
+        
         let host = check_port(&host, RENDEZVOUS_PORT);
-        log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
-        
-        log::info!("DEBUG_MEDIATOR: TCP/WS connecting to {}", host);
+        let ws_url = hbb_common::websocket::check_ws(&host);
+        log::info!("DEBUG_TRACE: start_tcp -> check_ws returned: '{}'", ws_url);
 
-        let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
-        
-        log::info!("DEBUG_MEDIATOR: TCP/WS connected to {}", host);
+        log::info!("DEBUG_TRACE: Calling connect_tcp...");
+        let mut conn = match connect_tcp(host.clone(), CONNECT_TIMEOUT).await {
+            Ok(c) => {
+                log::info!("DEBUG_TRACE: connect_tcp SUCCESS");
+                c
+            },
+            Err(e) => {
+                log::error!("DEBUG_TRACE: connect_tcp FAILED: {}", e);
+                return Err(e);
+            }
+        };
 
         let key = crate::get_key(true).await;
-        crate::secure_tcp(&mut conn, &key).await?;
+        log::info!("DEBUG_TRACE: Securing TCP...");
+        if let Err(e) = crate::secure_tcp(&mut conn, &key).await {
+            log::error!("DEBUG_TRACE: secure_tcp FAILED: {}", e);
+            return Err(e);
+        }
+        log::info!("DEBUG_TRACE: TCP Secured.");
         
         log::info!("DEBUG_MEDIATOR: Connection secured/ready");
 
@@ -365,6 +387,8 @@ impl RendezvousMediator {
         
         Config::set_host_key_confirmed(&rz.host_prefix, false);
         
+        log::info!("DEBUG_TRACE: Entering main loop");
+        
         loop {
 
             log::info!("DEBUG_MEDIATOR: Loop tick"); 
@@ -378,6 +402,7 @@ impl RendezvousMediator {
             };
             select! {
                 res = conn.next() => {
+                    log::info!("DEBUG_TRACE: Received packet from server");
                     last_recv_msg = Instant::now();
                     log::info!("DEBUG_MEDIATOR: Received data from server");
 
@@ -387,6 +412,7 @@ impl RendezvousMediator {
                         continue; // heartbeat
                     }
                     let msg = Message::parse_from_bytes(&bytes)?;
+                    log::info!("DEBUG_TRACE: Handling message type: {:?}", msg.union);
                     rz.handle_resp(msg.union, Sink::Stream(&mut conn), &server, &mut update_latency).await?
                 }
                 _ = timer.tick() => {
@@ -405,10 +431,10 @@ impl RendezvousMediator {
                     log::info!("DEBUG_MEDIATOR: Check send. KeyConf: {}, HostConf: {}, TimePassed: {}", key_confirmed, host_confirmed, time_passed);
 
                     if (!key_confirmed || !host_confirmed) && time_passed >= REG_INTERVAL {
-                        log::info!("DEBUG_MEDIATOR: Sending RegisterPk...");
+                        log::info!("DEBUG_TRACE: Timer trigger -> Sending RegisterPk");
                         match rz.register_pk(Sink::Stream(&mut conn)).await {
-                            Ok(_) => log::info!("DEBUG_MEDIATOR: RegisterPk sent successfully"),
-                            Err(e) => log::error!("DEBUG_MEDIATOR: Failed to send RegisterPk: {}", e),
+                            Ok(_) => log::info!("DEBUG_TRACE: RegisterPk sent OK"),
+                            Err(e) => log::error!("DEBUG_TRACE: RegisterPk sent ERROR: {}", e),
                         }
                         last_register_sent = Some(Instant::now());
                     }
@@ -419,17 +445,18 @@ impl RendezvousMediator {
     }
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
-        log::info!("start rendezvous mediator of {}", host);
-        //If the investment agent type is http or https, then tcp forwarding is enabled.
-        if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
-            || Config::is_proxy()
-            || use_ws()
-            || crate::is_udp_disabled()
-        {
-            Self::start_tcp(server, host).await
-        } else {
-            Self::start_udp(server, host).await
-        }
+        log::info!("DEBUG_TRACE: start() called for host: '{}'", host);
+        
+        let is_debug = cfg!(debug_assertions) && option_env!("TEST_TCP").is_some();
+        let is_proxy = Config::is_proxy();
+        let use_ws_val = use_ws();
+        let udp_disabled = crate::is_udp_disabled();
+        
+        log::info!("DEBUG_TRACE: Conditions -> Debug: {}, Proxy: {}, UseWS: {}, UdpDisabled: {}", 
+                   is_debug, is_proxy, use_ws_val, udp_disabled);
+
+        log::info!("DEBUG_TRACE: FORCE executing start_tcp for {}", host);
+        Self::start_tcp(server, host).await
     }
 
     async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
