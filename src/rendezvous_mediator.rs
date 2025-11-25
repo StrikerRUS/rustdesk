@@ -113,7 +113,7 @@ impl RendezvousMediator {
                     let timeout = timeout.clone();
                     futs.push(tokio::spawn(async move {
                         log::info!("DEBUG_TRACE: Spawning connection task for host: {}", host);
-                        if let Err(err) = Self::start(server, host).await {
+                        if let Err(err) = Self::start(server, host.clone()).await {
                             log::error!("DEBUG_TRACE: start() failed for {}: {}", host, err);
                             let err = format!("rendezvous mediator error: {err}");
                             // When user reboot, there might be below error, waiting too long
