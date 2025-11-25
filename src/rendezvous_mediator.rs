@@ -347,37 +347,33 @@ impl RendezvousMediator {
     }
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
-        log::info!("DEBUG_TRACE: start_tcp ENTERED for {}", host);
-        
-        let host = check_port(&host, RENDEZVOUS_PORT);
-        let ws_url = hbb_common::websocket::check_ws(&host);
-        log::info!("DEBUG_TRACE: start_tcp -> check_ws returned: '{}'", ws_url);
+        log::info!("DEBUG_TRACE: start_tcp ENTERED for host: {}", host);
 
-        log::info!("DEBUG_TRACE: Calling connect_tcp...");
-        let mut conn = match connect_tcp(host.clone(), CONNECT_TIMEOUT).await {
+        let host_with_port = check_port(&host, RENDEZVOUS_PORT);
+        log::info!("DEBUG_TRACE: Preparing to connect to logical address: {}", host_with_port);
+
+        let mut conn = match connect_tcp(host_with_port.clone(), CONNECT_TIMEOUT).await {
             Ok(c) => {
-                log::info!("DEBUG_TRACE: connect_tcp SUCCESS");
+                log::info!("DEBUG_TRACE: connect_tcp to {} SUCCESS", host_with_port);
                 c
             },
             Err(e) => {
-                log::error!("DEBUG_TRACE: connect_tcp FAILED: {}", e);
+                log::error!("DEBUG_TRACE: connect_tcp to {} FAILED: {}", host_with_port, e);
                 return Err(e);
             }
         };
 
+        log::info!("DEBUG_TRACE: Connection established. Securing...");
         let key = crate::get_key(true).await;
-        log::info!("DEBUG_TRACE: Securing TCP...");
         if let Err(e) = crate::secure_tcp(&mut conn, &key).await {
-            log::error!("DEBUG_TRACE: secure_tcp FAILED: {}", e);
+             log::error!("DEBUG_TRACE: secure_tcp FAILED: {}", e);
             return Err(e);
         }
-        log::info!("DEBUG_TRACE: TCP Secured.");
-        
-        log::info!("DEBUG_MEDIATOR: Connection secured/ready");
+        log::info!("DEBUG_TRACE: Connection secured.");
 
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
-            host: host.clone(),
+            host: host.clone(), // используем оригинальный хост без порта для rz
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
@@ -387,12 +383,9 @@ impl RendezvousMediator {
         
         Config::set_host_key_confirmed(&rz.host_prefix, false);
         
-        log::info!("DEBUG_TRACE: Entering main loop");
-        
+        log::info!("DEBUG_TRACE: Entering main loop for {}", host);
+
         loop {
-
-            log::info!("DEBUG_MEDIATOR: Loop tick"); 
-
             let mut update_latency = || {
                 let latency = last_register_sent
                     .map(|x| x.elapsed().as_micros() as i64)
@@ -402,42 +395,35 @@ impl RendezvousMediator {
             };
             select! {
                 res = conn.next() => {
-                    log::info!("DEBUG_TRACE: Received packet from server");
                     last_recv_msg = Instant::now();
-                    log::info!("DEBUG_MEDIATOR: Received data from server");
-
                     let bytes = res.ok_or_else(|| anyhow::anyhow!("Rendezvous connection is reset by the peer"))??;
                     if bytes.is_empty() {
                         conn.send_bytes(bytes::Bytes::new()).await?;
-                        continue; // heartbeat
+                        continue; 
                     }
                     let msg = Message::parse_from_bytes(&bytes)?;
-                    log::info!("DEBUG_TRACE: Handling message type: {:?}", msg.union);
+                    log::info!("DEBUG_TRACE: Received message type: {:?}", msg.union);
                     rz.handle_resp(msg.union, Sink::Stream(&mut conn), &server, &mut update_latency).await?
                 }
                 _ = timer.tick() => {
-                    if SHOULD_EXIT.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
-                        log::error!("DEBUG_MEDIATOR: Timeout! KeepAlive expired.");
+                     if SHOULD_EXIT.load(Ordering::SeqCst) { break; }
+                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
+                        log::error!("DEBUG_TRACE: Timeout! KeepAlive expired.");
                         bail!("Rendezvous connection is timeout");
-                    }
+                     }
+                     
+                     let key_conf = Config::get_key_confirmed();
+                     let host_conf = Config::get_host_key_confirmed(&rz.host_prefix);
+                     let elapsed = last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL);
 
-                    let key_confirmed = Config::get_key_confirmed();
-                    let host_confirmed = Config::get_host_key_confirmed(&rz.host_prefix);
-                    let time_passed = last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL);
-                    
-                    log::info!("DEBUG_MEDIATOR: Check send. KeyConf: {}, HostConf: {}, TimePassed: {}", key_confirmed, host_confirmed, time_passed);
-
-                    if (!key_confirmed || !host_confirmed) && time_passed >= REG_INTERVAL {
+                     if (!key_conf || !host_conf) && elapsed >= REG_INTERVAL {
                         log::info!("DEBUG_TRACE: Timer trigger -> Sending RegisterPk");
                         match rz.register_pk(Sink::Stream(&mut conn)).await {
                             Ok(_) => log::info!("DEBUG_TRACE: RegisterPk sent OK"),
                             Err(e) => log::error!("DEBUG_TRACE: RegisterPk sent ERROR: {}", e),
                         }
                         last_register_sent = Some(Instant::now());
-                    }
+                     }
                 }
             }
         }
