@@ -373,7 +373,7 @@ impl RendezvousMediator {
 
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
-            host: host.clone(), // используем оригинальный хост без порта для rz
+            host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
